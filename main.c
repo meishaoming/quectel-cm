@@ -16,6 +16,52 @@ UINT ifc_get_addr(const char *ifname);
 static int check_ipv4_address(PROFILE_T *profile);
 #endif
 
+static void update_raw_ip(const char *adapter)
+{
+    char raw_ip_path[128];
+
+    snprintf(raw_ip_path, sizeof(raw_ip_path), "/sys/class/net/%s/qmi/raw_ip", adapter);
+
+    printf("update %s\n", raw_ip_path);
+
+    if (access(raw_ip_path, R_OK) == -1)
+    {
+        fprintf(stderr, "access %s failed\n", raw_ip_path);
+        exit(EXIT_FAILURE);
+    }
+
+    int fd = open(raw_ip_path, O_RDWR);
+    if (fd < 0)
+    {
+        fprintf(stderr, "open %s failed: %s\n", raw_ip_path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    char buf[1];
+
+    if (read(fd, buf, 1) != 1)
+    {
+        fprintf(stderr, "read %s failed: %s\n", raw_ip_path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    printf("%s is %C\n", raw_ip_path, buf[0]);
+
+    if (buf[0] != 'Y')
+    {
+        buf[0] = 'Y';
+        lseek(fd, 0, SEEK_SET);
+        write(fd, buf, 1);
+        lseek(fd, 0, SEEK_SET);
+        read(fd, buf, 1);
+        printf("after write, %s is %C\n", raw_ip_path, buf[0]);
+        close(fd);
+        fprintf(stderr, "write Y and exit\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+
 static void usbnet_link_change(int link, PROFILE_T *profile) {
     static int s_link = -1;
 
@@ -25,7 +71,10 @@ static void usbnet_link_change(int link, PROFILE_T *profile) {
     s_link = link;
 
     if (link)
+    {
+        update_raw_ip(profile->usbnet_adapter);
         udhcpc_start(profile);
+    }
     else
         udhcpc_stop(profile);
 
@@ -59,7 +108,7 @@ static int check_ipv4_address(PROFILE_T *profile) {
          UINT remoteIP = ql_swap32(profile->ipv4.Address);
          unsigned char *l = (unsigned char *)&localIP;
          unsigned char *r = (unsigned char *)&remoteIP;
-         if (remoteIP != remoteIP || debug_qmi)
+         if (remoteIP != localIP || debug_qmi)
              dbg_time("localIP: %d.%d.%d.%d VS remoteIP: %d.%d.%d.%d",
                      l[0], l[1], l[2], l[3], r[0], r[1], r[2], r[3]);
          if (profile->IPType == 0x04)
@@ -225,18 +274,6 @@ static int usage(const char *progname) {
 static int qmidevice_detect(char **pp_qmichannel, char **pp_usbnet_adapter) {
     struct dirent* ent = NULL;
     DIR *pDir;
-#if 0 //ndef ANDROID
-    int osmaj, osmin, ospatch;
-    static struct utsname utsname;    /* for the kernel version */
-    static int kernel_version;
-#define KVERSION(j,n,p)    ((j)*1000000 + (n)*1000 + (p))
-
-    /* get the kernel version now, since we are called before sys_init */
-    uname(&utsname);
-    osmaj = osmin = ospatch = 0;
-    sscanf(utsname.release, "%d.%d.%d", &osmaj, &osmin, &ospatch);
-    kernel_version = KVERSION(osmaj, osmin, ospatch);
-#endif
 
     if ((pDir = opendir("/dev")) == NULL)  {
         dbg_time("Cannot open directory: %s, errno:%d (%s)", "/dev", errno, strerror(errno));
@@ -256,13 +293,8 @@ static int qmidevice_detect(char **pp_qmichannel, char **pp_usbnet_adapter) {
             else
             {
                 sprintf(net_path, "/sys/class/net/usb%s", &ent->d_name[strlen("qcqmi")]);
-                #if 0//ndef ANDROID
-                if (kernel_version >= KVERSION( 2,6,39 ))
-                    sprintf(net_path, "/sys/class/net/eth%s", &ent->d_name[strlen("qcqmi")]);
-                #else
                 if (access(net_path, R_OK) && errno == ENOENT)
                     sprintf(net_path, "/sys/class/net/eth%s", &ent->d_name[strlen("qcqmi")]);
-                #endif
             }
 
             if (access(net_path, R_OK) == 0)
@@ -288,11 +320,7 @@ static int qmidevice_detect(char **pp_qmichannel, char **pp_usbnet_adapter) {
     return (*pp_qmichannel && *pp_usbnet_adapter);
 }
 
-#if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
-int quectel_CM(int argc, char *argv[])
-#else
 int main(int argc, char *argv[])
-#endif
 {
     int triger_event = 0;
     int opt = 1;
@@ -383,7 +411,8 @@ int main(int argc, char *argv[])
     }
 
     dbg_time("Quectel_Linux_ConnectManager_SR01A01V21");
-    dbg_time("%s profile[%d] = %s/%s/%s/%d, pincode = %s", argv[0], profile.pdp, profile.apn, profile.user, profile.password, profile.auth, profile.pincode);
+    dbg_time("%s profile[%d] = %s/%s/%s/%d, pincode = %s",
+             argv[0], profile.pdp, profile.apn, profile.user, profile.password, profile.auth, profile.pincode);
 
     signal(SIGUSR1, ql_sigaction);
     signal(SIGUSR2, ql_sigaction);
@@ -429,14 +458,6 @@ __main_loop:
         return errno;
     }
 
-#if 0 //for test only, make fd > 255
-{
-    int max_dup = 255;
-    while (max_dup--)
-        dup(0);
-}
-#endif
-
     kill_brothers(profile.qmichannel);
 
     qmichannel = profile.qmichannel;
@@ -474,21 +495,7 @@ __main_loop:
     requestBaseBandVersion(NULL);
 #endif
     requestSetEthMode(&profile);
-    if (profile.rawIP && !strncmp(profile.qmichannel, "/dev/cdc-wdm", strlen("/dev/cdc-wdm"))) {
-        char raw_ip_switch[128] = {0};
-        sprintf(raw_ip_switch, "/sys/class/net/%s/qmi/raw_ip", profile.usbnet_adapter);
-        if (!access(raw_ip_switch, R_OK)) {
-            int raw_ip_fd = -1;
-            raw_ip_fd = open(raw_ip_switch, O_RDWR);
-            if (raw_ip_fd >= 0) {
-                write(raw_ip_fd, "1", strlen("1"));
-                close(raw_ip_fd);
-                raw_ip_fd = -1;
-            } else {
-                dbg_time("open %s failed, errno = %d(%s)\n", raw_ip_switch, errno, strerror(errno));
-            }
-        }
-    }
+
 #ifdef CONFIG_SIM
     requestGetSIMStatus(&SIMStatus);
     if ((SIMStatus == SIM_PIN) && profile.pincode) {
@@ -581,11 +588,7 @@ __main_loop:
                             if (QWDS_PKT_DATA_CONNECTED != ConnectionStatus || check_ipv4_address(&profile) == 0) //local ip is different with remote ip
                             {
                                 requestDeactivateDefaultPDP();
-                                #if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
-                                kill(getpid(), SIGTERM); //android will setup data call again
-                                #else
                                 send_signo_to_main(SIGUSR1);                                   
-                                #endif
                             }
                         break;
                         
@@ -632,19 +635,11 @@ __main_loop:
                         
                         case RIL_UNSOL_DATA_CALL_LIST_CHANGED:
                         {
-                            #if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
-                            UCHAR oldConnectionStatus = ConnectionStatus;
-                            #endif
                             requestQueryDataCall(&ConnectionStatus);
                             if (QWDS_PKT_DATA_CONNECTED != ConnectionStatus)
                             {
                                 usbnet_link_change(0, &profile);
-                                #if defined(ANDROID) || defined(LINUX_RIL_SHLIB)
-                                if (oldConnectionStatus == QWDS_PKT_DATA_CONNECTED) //connected change to disconnect
-                                    kill(getpid(), SIGTERM); //android will setup data call again
-                                #else
                                 send_signo_to_main(SIGUSR1);                                   
-                                #endif
                             } else if (QWDS_PKT_DATA_CONNECTED == ConnectionStatus) {
                                 requestGetIPAddress(&profile);
                                 usbnet_link_change(1, &profile);
@@ -661,6 +656,7 @@ __main_loop:
     }
 
 __main_quit:
+
     usbnet_link_change(0, &profile);
     if (pthread_join(gQmiThreadID, NULL)) {
         dbg_time("%s Error joining to listener thread (%s)", __func__, strerror(errno));

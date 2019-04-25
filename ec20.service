@@ -1,0 +1,14 @@
+[Unit]
+Description=EC20 4G modem daemon
+After=network.target
+
+[Service]
+Type=idle
+User=root
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/quectel-CM
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
